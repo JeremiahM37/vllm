@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Triton-based W8A16 (fp8 weight, bf16/fp16 activation) GEMM for ROCm gfx90a.
+Triton-based W8A16 (fp8 weight, bf16/fp16 activation) GEMM for ROCm.
+
+The original gfx90a measurements below describe the MI210 path. gfx1151 uses
+a separate tile ladder, padded weight rows, and an opaque custom op so that
+compiled prefill and decode retain runtime tile selection.
 
 Dequantizes float8_e4m3fn weights inside the GEMM's inner loop and feeds the
 result straight to MFMA, so the fp8 bytes are the only weight traffic and the
@@ -15,7 +19,7 @@ Weight layout expected by this kernel (post-process_weights_after_loading):
   weight:       [K, N]  float8_e4m3fn, viewed as uint8 by the kernel.
                 Arrives as `layer.weight.t()` from the scheme, i.e. a view of a
                 C-contiguous [N, K] buffer, so K is the contiguous dim
-                (stride_bk == 1, stride_bn == K). Strides are passed
+                (stride_bk == 1; stride_bn may include padding). Strides are passed
                 explicitly; no layout is assumed. See _WEIGHT_LAYOUT below.
   weight_scale: [N]  float32, one scale per output channel.
 
@@ -77,7 +81,7 @@ M=1 and is unaffected. Left in place rather than deleted because the
 view-vs-copy RATIO is what they are cited for, and both columns moved together.
 
 MEASURED AT the triton_fp8_w8a16_gemm wrapper: host wall clock with a
-torch.cuda.synchronize inside the timed region. That boundary includes the
+torch.accelerator.synchronize inside the timed region. That boundary includes the
 output allocation and the launch/sync cost of every call, so it is lower than
 the kernel alone and higher than what a layer actually sees. For gate_up at
 M=1 the same work measures roughly:
@@ -310,6 +314,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
@@ -485,9 +490,19 @@ def triton_fp8_w8a16_gemm(
     num_warps = None
 
     if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx90a
+        from vllm.platforms.rocm import on_gfx90a, on_gfx1151
 
-        if on_gfx90a():
+        if on_gfx1151():
+            if M <= 16:
+                BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 64
+                num_warps = 2
+            elif M <= 128:
+                BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
+                num_warps = 4
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
+                num_warps = 4
+        elif on_gfx90a():
             # Cloned from the gfx90a ladder in mixed_precision/triton_w4a16.py,
             # which was searched over 69 configurations at M=1 on this exact
             # card. That search was run against int4 decode; fp8 decode is
@@ -579,9 +594,36 @@ def triton_fp8_w8a16_gemm(
     return c
 
 
+def _rdna_w8a16_fp8(
+    a: torch.Tensor,
+    b_fp8: torch.Tensor,
+    scales: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return triton_fp8_w8a16_gemm(a, b_fp8, scales, bias, out_dtype)
+
+
+def _rdna_w8a16_fp8_fake(
+    a: torch.Tensor,
+    b_fp8: torch.Tensor,
+    scales: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.empty((a.shape[0], b_fp8.shape[1]), device=a.device, dtype=out_dtype)
+
+
+# Keep the tile ladder outside Dynamo: tracing a prefill shape otherwise
+# specializes the wide tile into graphs that also serve single-token decode.
+direct_register_custom_op(
+    "rdna_w8a16_fp8", _rdna_w8a16_fp8, fake_impl=_rdna_w8a16_fp8_fake
+)
+
+
 class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
     """
-    Triton W8A16 fp8 GEMM for ROCm gfx90a (MI210).
+    Triton W8A16 fp8 GEMM for ROCm gfx90a and gfx1151.
 
     Consumes bf16/fp16 activations directly -- no activation quantization --
     and dequantizes float8_e4m3fn weights in the GEMM inner loop.
@@ -599,17 +641,13 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
-        # Gated on gfx90a, on evidence rather than on validity. The dequant is
-        # portable IEEE bit manipulation, but the subnormal-flush workaround
-        # and the tile ladder are both measured facts about CDNA2 MFMA and
-        # about a 104-CU card. Nobody has measured gfx942 or RDNA here, so
-        # they keep their existing kernels. Widen once someone does.
+        # Keep unmeasured architectures on their existing kernel paths.
         if not current_platform.is_rocm():
             return False, "TritonW8A16Fp8Linear requires ROCm"
-        from vllm.platforms.rocm import on_gfx90a
+        from vllm.platforms.rocm import on_gfx90a, on_gfx1151
 
-        if not on_gfx90a():
-            return False, "TritonW8A16Fp8Linear is only tuned/verified on gfx90a"
+        if not (on_gfx90a() or on_gfx1151()):
+            return False, "TritonW8A16Fp8Linear requires gfx90a or gfx1151"
         return True, None
 
     @classmethod
@@ -630,7 +668,7 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
             # which is float8_e4m3fnUZ on the ROCm targets where is_fp8_fnuz()
             # holds. fnuz has exponent bias 8, no signed zero, and NaN only at
             # 0x80 -- the shift/carry derivation in the module header is for
-            # e4m3fn and would silently mis-decode every fnuz weight by a
+            # e4m3fn and would incorrectly decode every fnuz weight by a
             # factor of two. e5m2 likewise needs its own derivation. Reject.
             return (
                 False,
@@ -660,7 +698,7 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
         `.t()` view of the C-contiguous [N, K] checkpoint buffer, so K is the
         contiguous dimension.
 
-        _WEIGHT_LAYOUT: that view is left alone deliberately, not made
+        _WEIGHT_LAYOUT: on gfx90a that view is left alone, not made
         contiguous. With K contiguous, one column of a [BLOCK_K, BLOCK_N] tile
         is BLOCK_K consecutive bytes (128 at the decode tile), which coalesces;
         calling .contiguous() would flip that to BLOCK_N consecutive bytes per
@@ -690,7 +728,7 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
                 "TritonW8A16Fp8Linear: weight contains float8_e4m3fn NaN codes "
                 "(0x7F/0xFF). This kernel's bit-trick dequant decodes them to a "
                 "finite 480.0 instead of propagating NaN, so the checkpoint is "
-                "rejected rather than silently mis-evaluated."
+                "rejected rather than silently evaluated incorrectly."
             )
 
         # Per-channel scale as contiguous fp32 [N]. Checkpoints store this as
@@ -706,6 +744,16 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
                 f"{s.numel()}"
             )
         replace_parameter(layer, "weight_scale", s)
+
+        from vllm.platforms.rocm import on_gfx1151
+
+        k, n = w.shape
+        if on_gfx1151() and k >= 1024 and k % 512 == 0:
+            # Shift FP8 rows by one cache line to avoid the measured stride
+            # cliffs. Preserve logical dimensions and the contiguous K axis.
+            padded = torch.empty((n, k + 128), dtype=w.dtype, device=w.device)
+            padded[:, :k].copy_(w.t())
+            replace_parameter(layer, "weight", padded[:, :k].t())
 
     def apply_weights(
         self,
@@ -724,7 +772,10 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
         out_shape = x.shape[:-1] + (weight.shape[1],)
 
         out_dtype = self.config.out_dtype or x.dtype
-        output = triton_fp8_w8a16_gemm(
+        from vllm.platforms.rocm import on_gfx1151
+
+        gemm = torch.ops.vllm.rdna_w8a16_fp8 if on_gfx1151() else triton_fp8_w8a16_gemm
+        output = gemm(
             a=x_2d,
             b_fp8=weight,
             scales=scales,

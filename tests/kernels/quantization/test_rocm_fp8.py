@@ -14,7 +14,7 @@ from tests.kernels.quant_utils import (
     ref_dynamic_per_tensor_fp8_quant,
     ref_dynamic_per_token_quant,
 )
-from tests.kernels.utils import _assert_deterministic
+from tests.kernels.utils import _assert_deterministic, opcheck
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -539,3 +539,104 @@ def test_fp8_per_token_quant_matches_reference():
         pass_rate=0.99,
         max_fail_rate=1e-4,
     )
+
+
+def _gfx1151_w8a16_layer(dtype, k, n):
+    from vllm.model_executor.kernels.linear.scaled_mm.triton_fp8_w8a16 import (
+        FP8ScaledMMLinearLayerConfig,
+        TritonW8A16Fp8LinearKernel,
+        kFp8StaticChannelSym,
+        kFp8StaticTensorSym,
+    )
+    from vllm.platforms.rocm import on_gfx1151
+
+    if not on_gfx1151():
+        pytest.skip("W8A16 RDNA path is verified on gfx1151")
+    config = FP8ScaledMMLinearLayerConfig(
+        weight_quant_key=kFp8StaticChannelSym,
+        activation_quant_key=kFp8StaticTensorSym,
+        weight_shape=(n, k),
+        input_dtype=dtype,
+        out_dtype=dtype,
+    )
+    kernel = TritonW8A16Fp8LinearKernel(config, ["weight", "weight_scale"])
+    layer = torch.nn.Module()
+    weight = torch.randn(n, k, device=DEVICE).to(torch.float8_e4m3fn)
+    scales = torch.logspace(-3, 1, n, device=DEVICE)
+    layer.weight = torch.nn.Parameter(weight.t(), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    kernel.process_weights_after_loading(layer)
+    return kernel, layer, weight, scales
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m,k", [(1, 896), (17, 1024), (129, 1536)])
+def test_gfx1151_w8a16_strides_bias_and_graph_replay(dtype, m, k):
+    """Load-time padding and strided inputs must preserve the scaled GEMM."""
+    from vllm.model_executor.kernels.linear.scaled_mm.triton_fp8_w8a16 import (
+        triton_fp8_w8a16_gemm,
+    )
+
+    set_random_seed(1007)
+    kernel, layer, weight, scales = _gfx1151_w8a16_layer(dtype, k, 65)
+    x = torch.randn(m, k * 2, device=DEVICE, dtype=dtype)[:, ::2]
+    bias = torch.randn(65, device=DEVICE, dtype=dtype)
+    opcheck(
+        torch.ops.vllm.rdna_w8a16_fp8,
+        (x.contiguous(), layer.weight, layer.weight_scale, bias, dtype),
+    )
+    out = kernel.apply_weights(layer, x, bias)
+    unpadded = triton_fp8_w8a16_gemm(x.contiguous(), weight.t(), scales, bias)
+    torch.testing.assert_close(out, unpadded, rtol=0, atol=0)
+    ref = x.cpu().double() @ weight.cpu().double().t()
+    ref = ref * scales.cpu().double() + bias.cpu().double()
+    relative_error = (out.cpu().double() - ref).norm() / ref.norm()
+    assert relative_error < (0.005 if dtype == torch.bfloat16 else 0.001)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            kernel.apply_weights(layer, x, bias)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = kernel.apply_weights(layer, x, bias)
+    x.neg_()
+    graph.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(
+        captured, kernel.apply_weights(layer, x, bias), rtol=0, atol=0
+    )
+
+
+def test_gfx1151_w8a16_compiled_prefill_does_not_freeze_decode_tile(monkeypatch):
+    """A prefill-first compile must still select the narrow tile for decode."""
+    from vllm.model_executor.kernels.linear.scaled_mm import triton_fp8_w8a16
+
+    kernel, layer, _, _ = _gfx1151_w8a16_layer(torch.bfloat16, 1536, 65)
+    original = triton_fp8_w8a16.triton_fp8_w8a16_gemm_kernel
+    tiles = []
+
+    class LaunchRecorder:
+        def __getitem__(self, grid):
+            launch = original[grid]
+
+            def run(*args, **kwargs):
+                tiles.append(kwargs["BLOCK_M"])
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(
+        triton_fp8_w8a16, "triton_fp8_w8a16_gemm_kernel", LaunchRecorder()
+    )
+    compiled = torch.compile(
+        lambda x: kernel.apply_weights(layer, x), dynamic=True, fullgraph=True
+    )
+    for m, expected_tile in [(512, 128), (1, 16), (16, 16), (128, 32), (1, 16)]:
+        x = torch.randn(m, 1536, device=DEVICE, dtype=torch.bfloat16)
+        tiles.clear()
+        out = compiled(x)
+        assert tiles and set(tiles) == {expected_tile}
+        torch.testing.assert_close(out, kernel.apply_weights(layer, x), rtol=0, atol=0)

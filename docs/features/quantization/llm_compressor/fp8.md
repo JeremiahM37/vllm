@@ -16,6 +16,16 @@ The FP8 types typically supported in hardware have two distinct representations,
     FP8 computation is supported on NVIDIA GPUs with compute capability >= 8.9 (Ada Lovelace, Hopper).
     FP8 models will run on compute capability >= 7.5 (Turing) as weight-only W8A16, utilizing FP8 Marlin.
 
+## Weight-only FP8 on Radeon gfx1151
+
+On ROCm gfx1151 (Radeon 8060S), compressed-tensors weight-only E4M3FN
+checkpoints with per-channel scales can use the fused Triton W8A16 kernel.
+Activations remain BF16 or FP16; the kernel dequantizes weights during GEMM.
+For example, load an existing weight-only checkpoint with
+`LLM("/path/to/weight-only-fp8-checkpoint", dtype="bfloat16")`.
+This path is distinct from the W8A8 quantization recipe below. Performance
+depends on model size and workload; FP8 storage does not guarantee a speedup.
+
 ## Installation
 
 To produce performant FP8 quantized models with vLLM, you'll need to install the [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:
